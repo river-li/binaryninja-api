@@ -339,9 +339,11 @@ Ref<Type> Resolver::GetTypeFromViewAndPlatform(string typeName)
 	return result.type;
 }
 
-bool Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidPos, int interfacePos)
+pair<string, string> Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidPos, int interfacePos)
 {
 	auto hlils = HighLevelILExprsAt(func, m_view->GetDefaultArchitecture(), addr);
+    string resultProtocol;
+    string resultGuid;
 	for (auto hlil : hlils)
 	{
 		if (hlil.operation != HLIL_CALL)
@@ -471,7 +473,11 @@ bool Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidP
 
 			auto refs = m_view->GetCodeReferences(func->GetStart());
 			for (auto& ref : refs)
-				resolveGuidInterface(ref.func, ref.addr, incomingGuidIdx, incomingInstrIdx);
+            {
+                auto namePair = resolveGuidInterface(ref.func, ref.addr, incomingGuidIdx, incomingInstrIdx);
+                // Since it's a wrapper function, we don't use the service name
+                m_protocol_usages.push_back(make_tuple(addr, "Protocol Wrapper", namePair.first, namePair.second));
+            }
 			continue;
 		}
 
@@ -479,10 +485,10 @@ bool Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidP
 			continue;
 
 		auto names = lookupGuid(guid);
-		string protocol_name = names.first;
+		string protocolName = names.first;
 		string guidName = names.second;
 
-		if (protocol_name.empty())
+		if (protocolName.empty())
 		{
 			// protocol name is empty
 			if (!guidName.empty())
@@ -498,7 +504,7 @@ bool Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidP
 				string errors;
 				bool ok = m_view->ParseTypeString(possible_protocol_type, result, errors);
 				if (ok)
-					protocol_name = possible_protocol_type;
+					protocolName = possible_protocol_type;
 			}
 			else
 			{
@@ -507,6 +513,7 @@ bool Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidP
 				guidName = nonConflictingName("UnknownProtocolGuid");
 			}
 		}
+        resultGuid = guidName;
 
 		// now we just need to rename the GUID and apply the protocol type
 		auto sym = m_view->GetSymbolByAddress(guidAddr.value);
@@ -518,17 +525,22 @@ bool Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidP
 		string errors;
 		bool ok = m_view->ParseTypeString("EFI_GUID", result, errors);
 		if (!ok)
-			return false;
+			return make_pair("", "");
 		m_view->DefineDataVariable(guidAddr.value, result.type);
 		m_view->DefineUserSymbol(new Symbol(DataSymbol, guidVarName, guidAddr.value));
 
-		if (protocol_name.empty())
+        if (protocolName.empty())
 		{
 			LogWarn("Found unknown protocol at 0x%llx", addr);
-			protocol_name = "VOID*";
+			protocolName = "VOID*";
+            resultProtocol = "UnknownProtocol";
 		}
+        else
+        {
+            resultProtocol = protocolName;
+        }
 
-		auto protocolType = GetTypeFromViewAndPlatform(protocol_name);
+		auto protocolType = GetTypeFromViewAndPlatform(protocolName);
 		if (!protocolType)
 			continue;
 		protocolType = Type::PointerType(m_view->GetDefaultArchitecture(), protocolType);
@@ -573,7 +585,7 @@ bool Resolver::resolveGuidInterface(Ref<Function> func, uint64_t addr, int guidP
 		m_view->UpdateAnalysisAndWait();
 	}
 
-	return true;
+	return make_pair(resultProtocol, resultGuid);
 }
 
 bool Resolver::defineTypeAtCallsite(
@@ -750,4 +762,123 @@ pair<string, string> Resolver::defineAndLookupGuid(uint64_t addr)
 	}
 
 	return namePair;
+}
+
+static string guidToStr(const EFI_GUID& guid)
+{
+    ostringstream ss;
+    ss << uppercase << hex << setfill('0');
+    ss << std::setw(2) << static_cast<uint>(guid[3])
+       << std::setw(2) << static_cast<uint>(guid[2])
+       << std::setw(2) << static_cast<uint>(guid[1])
+       << std::setw(2) << static_cast<uint>(guid[0])
+       << "-";
+    ss << std::setw(2) << static_cast<uint>(guid[5])
+       << std::setw(2) << static_cast<uint>(guid[4])
+       << "-";
+    ss << std::setw(2) << static_cast<uint>(guid[7])
+       << std::setw(2) << static_cast<uint>(guid[6])
+       << "-";
+
+    ss << setw(2) << static_cast<uint16_t>(guid[8]);
+    ss << setw(2) << static_cast<uint16_t>(guid[9]);
+    ss << setw(2) << static_cast<uint16_t>(guid[10]);
+    ss << setw(2) << static_cast<uint16_t>(guid[11]);
+    ss << setw(2) << static_cast<uint16_t>(guid[12]);
+    ss << setw(2) << static_cast<uint16_t>(guid[13]);
+    ss << setw(2) << static_cast<uint16_t>(guid[14]);
+    ss << setw(2) << static_cast<uint16_t>(guid[15]);
+    return ss.str();
+}
+
+void Resolver::generateReport()
+{
+    Ref<Settings> settings = Settings::Instance();
+    bool enabled = settings->Get<bool>("corePlugins.efiResolver.enableReport");
+    if (!enabled)
+        return;
+
+    if (m_service_usages.empty() && m_protocol_usages.empty()
+        && m_guid_usages.empty() && m_variable_usages.empty())
+        return;
+
+    ostringstream content;
+    content << "# Results of EFI Resolver" << endl;
+
+    if (!m_service_usages.empty())
+    {
+        content << "## UEFI Services" << endl;
+        content << "| Address | Service Name |" << endl;
+        content << "| :---: | :---: |" << endl;
+        for (auto service : m_service_usages)
+        {
+            ostringstream ss;
+            ss << std::hex << service.first;
+            string addrStr = ss.str();
+            content << "| [0x" << addrStr << "](binaryninja://?expr=" << addrStr << ") | " << service.second << endl;
+        }
+        content << endl << endl;
+    }
+
+    if (!m_protocol_usages.empty())
+    {
+        content << "## UEFI Protocols" << endl;
+        content << "| Address | Protocol Name |" << endl;
+        content << "| :---: | :---: |" << endl;
+
+        for (auto protocol : m_protocol_usages)
+        {
+            ostringstream ss;
+            ss << std::hex << get<0>(protocol);
+            string addrStr = ss.str();
+            content << "| [0x" << addrStr << "](binaryninja://?expr=" << addrStr << ") | "
+                    << get<1>(protocol) << " | "
+                    << get<2>(protocol) << " | "
+                    << get<3>(protocol) << " | ";
+        }
+        content << endl << endl;
+    }
+
+    if (!m_guid_usages.empty())
+    {
+        content << "## UEFI GUIDs" << endl;
+        content << "| Address | GUID | GUID Name | " << endl;
+        content << "| :---: | :---: | :---: |" << endl;
+
+        for (auto guid : m_guid_usages)
+        {
+            ostringstream ss;
+            ss << std::hex << guid.first;
+            string addrStr = ss.str();
+            string guidStr = guidToStr(guid.second);
+            auto guidName = lookupGuid(guid.second);
+            content << "| [0x" << addrStr << "](binaryninja://?expr=" << addrStr << ") | "
+                    << guidStr << " | "
+                    << guidName.second << " | " << endl;
+        }
+        content << endl << endl;
+    }
+
+    if (!m_variable_usages.empty())
+    {
+        content << "## UEFI Variables" << endl;
+        content << "| Address | Type |  Variable Name | DataSize | Guid Name | " << endl;
+        content << "| :---: | :---: | :---: | :---: | :---: |" << endl;
+
+        for (auto variable : m_variable_usages)
+        {
+            ostringstream ss;
+            ss << std::hex << get<0>(variable);
+            string addrStr = ss.str();
+            content << "| [0x" << addrStr << "](binaryninja://?expr=" << addrStr << ") | "
+                    << get<1>(variable) << " | "
+                    << get<2>(variable) << " | "
+                    << get<3>(variable) << " | "
+                    << get<4>(variable) << " | " << endl;
+        }
+        LogDebug("%s", content.str().c_str());
+        content << endl << endl;
+    }
+
+    m_view->ShowMarkdownReport("EFI Resolver Analysis Result", content.str(), "");
 }

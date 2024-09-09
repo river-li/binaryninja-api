@@ -269,7 +269,8 @@ bool PeiResolver::resolvePeiServices()
 			if (offset == 0x18 + m_width * 2)
 			{
 				// LocatePpi
-				resolveGuidInterface(ref.func, ref.addr, 1, 4);
+				auto namePair = resolveGuidInterface(ref.func, ref.addr, 1, 4);
+                m_protocol_usages.push_back({ref.addr, "LocatePpi", namePair.first, namePair.second});
 			}
 			else if (offset == 0x18 || offset == 0x18 + m_width || offset == 0x18 + m_width * 3)
 			{

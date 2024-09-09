@@ -28,7 +28,7 @@ void Run(Ref<BinaryView> view)
 	  LogInfo("Identifying module type");
 	  EFIModuleType moduleType = identifyModuleType(view);
 
-#ifndef DEBUG
+#ifndef DEBUG_BUILD
 	  auto undo = view->BeginUndoActions();
 #endif
 	  if (moduleType == PEI)
@@ -36,6 +36,7 @@ void Run(Ref<BinaryView> view)
 		  efiBackgroundTask->SetProgressText("Resolving PEIM...");
 		  auto resolver = PeiResolver(view, efiBackgroundTask);
 		  resolver.resolvePei();
+          resolver.generateReport();
 	  }
 	  else if (moduleType == DXE)
 	  {
@@ -44,9 +45,10 @@ void Run(Ref<BinaryView> view)
 		  resolver.resolveDxe();
 		  efiBackgroundTask->SetProgressText("Resolving MM related protocols...");
 		  resolver.resolveSmm();
+          resolver.generateReport();
 	  }
 
-#ifndef DEBUG
+#ifndef DEBUG_BUILD
 	  view->CommitUndoActions(undo);
 #endif
 	  efiBackgroundTask->Finish();
@@ -57,6 +59,15 @@ void Run(Ref<BinaryView> view)
 BINARYNINJAPLUGIN bool CorePluginInit()
 {
 	EfiGuidRenderer::Register();
+    Ref<Settings> settings = Settings::Instance();
+    settings->RegisterSetting("corePlugins.efiResolver.enableReport",R"(
+    {
+        "title" : "Automatic generate markdown report after analysis",
+        "type" : "boolean",
+        "default" : false,
+        "description" : "Enable automatic generation of markdown report after analysis",
+        "ignore" : ["SettingsProjectScope", "SettingsResourceScope"]
+    })");
 
 	PluginCommand::Register("EFI Resolver\\Resolve EFI Types And Protocols", "Resolve EFI Protocols", &Run);
 
